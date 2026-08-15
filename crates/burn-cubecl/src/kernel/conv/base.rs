@@ -9,7 +9,7 @@ use crate::{
     kernel::conv::{
         backward_data::{fallback::conv_data_backward_fallback, implicit_gemm::*},
         backward_weight::{fallback::conv_weight_backward_fallback, implicit_gemm::*},
-        forward::implicit_gemm::conv_gemm_simple_sync,
+        forward::implicit_gemm::conv_gemm_simple_sync_ref,
     },
     ops::{permute_nchw_to_nhwc, permute_nchw_to_nhwc_shape, permute_nhwc_to_nchw},
     tensor::CubeTensor,
@@ -90,11 +90,11 @@ pub fn conv_forward_nhwc<R: CubeRuntime, const N: usize>(
             if options.groups != 1 {
                 conv_direct::<R, N>(input, weight, bias, options)
             } else {
-                conv_gemm_simple_sync::<R, N>(
-                    input.clone(),
-                    weight.clone(),
-                    bias.clone(),
-                    options.clone(),
+                conv_gemm_simple_sync_ref::<R, N>(
+                    &input,
+                    &weight,
+                    bias.as_ref(),
+                    &options,
                     AcceleratedTileKind::Cmma,
                 )
                 .or_else(|_| conv_direct::<R, N>(input, weight, bias, options))

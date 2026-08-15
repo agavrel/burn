@@ -28,7 +28,31 @@ pub fn conv_gemm_simple_sync<R: CubeRuntime, const N: usize>(
         AcceleratedTileKind::Cmma => ConvAlgorithm::SimpleSyncCyclic,
         AcceleratedTileKind::Mma => ConvAlgorithm::SimpleSyncStrided,
     };
-    launch_convolution_forward::<R, N>(
+    launch_convolution_forward_ref::<R, N>(
+        &Strategy::Inferred {
+            algorithm,
+            tile_kind,
+        },
+        &input,
+        &weight,
+        bias.as_ref(),
+        &options,
+    )
+}
+
+/// Borrowing variant of [`conv_gemm_simple_sync`] for callers that need to retain the inputs.
+pub fn conv_gemm_simple_sync_ref<R: CubeRuntime, const N: usize>(
+    input: &CubeTensor<R>,
+    weight: &CubeTensor<R>,
+    bias: Option<&CubeTensor<R>>,
+    options: &ConvOptions<N>,
+    tile_kind: AcceleratedTileKind,
+) -> Result<CubeTensor<R>, ConvSetupError> {
+    let algorithm = match tile_kind {
+        AcceleratedTileKind::Cmma => ConvAlgorithm::SimpleSyncCyclic,
+        AcceleratedTileKind::Mma => ConvAlgorithm::SimpleSyncStrided,
+    };
+    launch_convolution_forward_ref::<R, N>(
         &Strategy::Inferred {
             algorithm,
             tile_kind,
@@ -103,6 +127,17 @@ pub fn launch_convolution_forward<R: CubeRuntime, const N: usize>(
     bias: Option<CubeTensor<R>>,
     options: ConvOptions<N>,
 ) -> Result<CubeTensor<R>, ConvSetupError> {
+    launch_convolution_forward_ref(strategy, &input, &weight, bias.as_ref(), &options)
+}
+
+/// Borrowing variant of [`launch_convolution_forward`].
+pub fn launch_convolution_forward_ref<R: CubeRuntime, const N: usize>(
+    strategy: &Strategy,
+    input: &CubeTensor<R>,
+    weight: &CubeTensor<R>,
+    bias: Option<&CubeTensor<R>>,
+    options: &ConvOptions<N>,
+) -> Result<CubeTensor<R>, ConvSetupError> {
     if options.groups != 1 {
         return Err(ConvSetupError::Groups(options.groups));
     }
@@ -136,7 +171,7 @@ pub fn launch_convolution_forward<R: CubeRuntime, const N: usize>(
 
     let bias = bias.map(|bias| {
         let dtype = bias.dtype;
-        InputBinding::Normal(bias.binding(), dtype_to_storage_type(dtype))
+        InputBinding::Normal(bias.binding_ref(), dtype_to_storage_type(dtype))
     });
 
     let client = input.client.clone();
@@ -147,8 +182,8 @@ pub fn launch_convolution_forward<R: CubeRuntime, const N: usize>(
     });
     let input_dtype = input.dtype;
     let weight_dtype = weight.dtype;
-    let input = InputBinding::new(input.binding(), dtype_to_storage_type(input_dtype));
-    let weight = InputBinding::new(weight.binding(), dtype_to_storage_type(weight_dtype));
+    let input = InputBinding::new(input.binding_ref(), dtype_to_storage_type(input_dtype));
+    let weight = InputBinding::new(weight.binding_ref(), dtype_to_storage_type(weight_dtype));
 
     launch_ref::<R, N>(
         strategy,
@@ -157,7 +192,7 @@ pub fn launch_convolution_forward<R: CubeRuntime, const N: usize>(
             input,
             weight,
             bias,
-            out: out.clone().binding(),
+            out: out.binding_ref(),
         },
         ConvolutionArgs {
             stride: options.stride,

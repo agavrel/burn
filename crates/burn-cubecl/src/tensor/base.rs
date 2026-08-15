@@ -201,6 +201,16 @@ where
         }
     }
 
+    /// Return a tensor binding without consuming the tensor.
+    pub fn binding_ref(&self) -> TensorBinding<R> {
+        TensorBinding {
+            handle: self.handle.clone().binding(),
+            strides: self.meta.strides().clone(),
+            shape: self.meta.shape().clone(),
+            runtime: PhantomData,
+        }
+    }
+
     /// Returns the element size of this tensor
     pub fn elem_size(&self) -> usize {
         self.dtype.size()

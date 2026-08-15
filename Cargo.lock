@@ -729,6 +729,7 @@ dependencies = [
  "burn-candle",
  "burn-core",
  "burn-cpu",
+ "burn-cubecl",
  "burn-cuda",
  "burn-dispatch",
  "burn-flex",
