@@ -37,9 +37,12 @@ impl Default for ConvStrategy {
         #[cfg(feature = "autotune")]
         return ConvStrategy::Autotune;
 
-        // if autotune is disabled, default to the more memory-conservative algorithm
+        // Without autotune, prefer the tiled implicit-GEMM path for dense
+        // convolutions. The direct kernel is a safe fallback for unsupported
+        // layouts and grouped convolutions, but is substantially slower for
+        // inference-sized channel counts on Metal.
         #[cfg(not(feature = "autotune"))]
-        ConvStrategy::Direct
+        ConvStrategy::ImplicitGemm
     }
 }
 
@@ -88,12 +91,13 @@ pub fn conv_forward_nhwc<R: CubeRuntime, const N: usize>(
                 conv_direct::<R, N>(input, weight, bias, options)
             } else {
                 conv_gemm_simple_sync::<R, N>(
-                    input,
-                    weight,
-                    bias,
-                    options,
+                    input.clone(),
+                    weight.clone(),
+                    bias.clone(),
+                    options.clone(),
                     AcceleratedTileKind::Cmma,
                 )
+                .or_else(|_| conv_direct::<R, N>(input, weight, bias, options))
             }
         }
     }

@@ -128,7 +128,14 @@ ndarray = ["burn-ndarray", "burn-core/ndarray"]
 tch = ["burn-tch", "burn-core/tch", "burn-vision?/tch"]
 vulkan = ["wgpu", "burn-core/vulkan", "burn-vision?/vulkan"]
 webgpu = ["wgpu", "burn-core/webgpu", "burn-vision?/webgpu"]
-metal = ["wgpu", "burn-core/metal", "burn-vision?/metal"]
+metal = [
+    "wgpu",
+    "extension",
+    "dep:burn-cubecl",
+    "cubecl",
+    "burn-core/metal",
+    "burn-vision?/metal",
+]
 wgpu = ["burn-wgpu", "burn-core/wgpu", "burn-vision?/wgpu"]
 cpu = ["burn-cpu", "burn-core/cpu", "burn-vision?/cpu"]
 
@@ -162,5 +169,6 @@ burn-wgpu = { workspace = true, optional = true }
 burn-ir = { workspace = true, optional = true }
 burn-autodiff = { workspace = true, optional = true }
 burn-dispatch = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
 
 cubecl = { workspace = true, optional = true }

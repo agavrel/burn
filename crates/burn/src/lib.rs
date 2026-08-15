@@ -118,7 +118,13 @@
 //!
 //! You can also check the details in sub-crates [`burn-core`](https://docs.rs/burn-core) and [`burn-train`](https://docs.rs/burn-train).
 
+extern crate self as burn;
+
 pub use burn_core::*;
+
+/// Metal-specific fused inference operations.
+#[cfg(all(feature = "metal", not(feature = "fusion")))]
+pub mod metal;
 
 /// Train module
 #[cfg(feature = "train")]

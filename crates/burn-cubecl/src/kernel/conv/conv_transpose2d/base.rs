@@ -23,9 +23,10 @@ impl Default for ConvTranspose2dStrategy {
         #[cfg(feature = "autotune")]
         return ConvTranspose2dStrategy::Autotune;
 
-        // if autotune is disabled, default to the more memory-conservative algorithm
+        // The GEMM/col2im path is a better default for inference-sized channel
+        // counts. Fall back to the direct kernel when a shape isn't supported.
         #[cfg(not(feature = "autotune"))]
-        ConvTranspose2dStrategy::Direct
+        ConvTranspose2dStrategy::Gemm
     }
 }
 
@@ -49,6 +50,9 @@ pub fn conv_transpose2d<R: CubeRuntime>(
         ConvTranspose2dStrategy::Autotune => {
             Ok(conv_transpose2d_autotune(input, weight, bias, options))
         }
-        ConvTranspose2dStrategy::Gemm => conv_transpose2d_col2im(input, weight, bias, options),
+        ConvTranspose2dStrategy::Gemm => {
+            conv_transpose2d_col2im(input.clone(), weight.clone(), bias.clone(), options.clone())
+                .or_else(|_| conv_transpose2d_direct(input, weight, bias, options))
+        }
     }
 }
