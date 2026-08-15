@@ -70,6 +70,7 @@ pub fn matmul<R: CubeRuntime>(
     }
 }
 
+#[cfg(feature = "autotune")]
 pub(crate) fn launch_matmul_naive<R: CubeRuntime>(
     strategy: &Strategy,
     mut lhs: CubeTensor<R>,

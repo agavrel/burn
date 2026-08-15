@@ -27,6 +27,7 @@ pub fn shape_divmod_range<R: CubeRuntime>(
     arg
 }
 
+#[cfg(feature = "autotune")]
 pub fn split_dim<R: CubeRuntime>(
     mut tensor: CubeTensor<R>,
     dim: usize,

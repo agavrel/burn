@@ -35,6 +35,7 @@ pub(crate) fn wgrad_gemm_simple_sync<R: CubeRuntime, const N: usize>(
     )
 }
 
+#[cfg(feature = "autotune")]
 pub(crate) fn wgrad_gemm_simple_async<R: CubeRuntime, const N: usize>(
     input: CubeTensor<R>,
     out_grad: CubeTensor<R>,
@@ -58,6 +59,7 @@ pub(crate) fn wgrad_gemm_simple_async<R: CubeRuntime, const N: usize>(
     )
 }
 
+#[cfg(feature = "autotune")]
 pub(crate) fn wgrad_gemm_simple_tma<R: CubeRuntime, const N: usize>(
     input: CubeTensor<R>,
     out_grad: CubeTensor<R>,

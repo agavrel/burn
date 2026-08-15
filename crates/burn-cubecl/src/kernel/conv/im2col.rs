@@ -1,16 +1,20 @@
+#[cfg(feature = "autotune")]
 use burn_backend::cubecl::dtype_to_storage_type;
+#[cfg(feature = "autotune")]
 use burn_backend::{
     DType,
     ops::{ConvOptions, conv::calculate_conv_output_sizes},
 };
+#[cfg(feature = "autotune")]
 use burn_std::{Metadata, Shape};
+#[cfg(feature = "autotune")]
 use core::iter;
-use cubecl::{
-    prelude::*,
-    std::tensor::{TensorHandle, into_contiguous_pitched},
-};
+use cubecl::prelude::*;
+#[cfg(feature = "autotune")]
+use cubecl::std::tensor::{TensorHandle, into_contiguous_pitched};
 use cubek::convolution::components::ConvSetupError;
 
+#[cfg(feature = "autotune")]
 use crate::{
     CubeRuntime,
     kernel::{
@@ -57,6 +61,7 @@ pub(crate) fn batches_per_run(
     Ok(1)
 }
 
+#[cfg(feature = "autotune")]
 pub fn conv_im2col_1x1<R: CubeRuntime, const N: usize>(
     input: CubeTensor<R>,
     mut weight: CubeTensor<R>,
@@ -133,6 +138,7 @@ pub fn conv_im2col_1x1<R: CubeRuntime, const N: usize>(
 }
 
 /// Reshapes NHWC input to [(N, H, W), C]
+#[cfg(feature = "autotune")]
 fn reshape_input<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
     let rank = input.meta.num_dims();
     let dim_c = rank - 1;
@@ -158,6 +164,7 @@ fn reshape_input<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
     input
 }
 
+#[cfg(feature = "autotune")]
 fn is_spatial_contiguous(shape: &[usize], strides: &[usize]) -> bool {
     let rank = shape.len();
     let dim_c = rank - 1;
@@ -175,6 +182,7 @@ fn is_spatial_contiguous(shape: &[usize], strides: &[usize]) -> bool {
     true
 }
 
+#[cfg(feature = "autotune")]
 fn from_handle<R: CubeRuntime>(
     client: ComputeClient<R>,
     device: R::Device,

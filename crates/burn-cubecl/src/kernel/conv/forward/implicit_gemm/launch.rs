@@ -10,37 +10,7 @@ use cubek::{
     std::InputBinding,
 };
 
-/// Perform a 2D convolution using the implicit GEMM (im2col) algorithm, using cubecl tiling matmul
-/// components. Uses [`CmmaLargeMAlgorithm`] for the stage size
-///
-/// * `input` - The input feature map
-/// * `weight` - The weights (filter) applied to each kernel
-/// * `bias` - The bias added to each channel
-/// * `options` - The options to use for the convolution
-pub fn conv_gemm_simple_sync<R: CubeRuntime, const N: usize>(
-    input: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    bias: Option<CubeTensor<R>>,
-    options: ConvOptions<N>,
-    tile_kind: AcceleratedTileKind,
-) -> Result<CubeTensor<R>, ConvSetupError> {
-    let algorithm = match tile_kind {
-        AcceleratedTileKind::Cmma => ConvAlgorithm::SimpleSyncCyclic,
-        AcceleratedTileKind::Mma => ConvAlgorithm::SimpleSyncStrided,
-    };
-    launch_convolution_forward_ref::<R, N>(
-        &Strategy::Inferred {
-            algorithm,
-            tile_kind,
-        },
-        &input,
-        &weight,
-        bias.as_ref(),
-        &options,
-    )
-}
-
-/// Borrowing variant of [`conv_gemm_simple_sync`] for callers that need to retain the inputs.
+/// Perform a convolution using the synchronous implicit GEMM algorithm.
 pub fn conv_gemm_simple_sync_ref<R: CubeRuntime, const N: usize>(
     input: &CubeTensor<R>,
     weight: &CubeTensor<R>,
@@ -64,6 +34,7 @@ pub fn conv_gemm_simple_sync_ref<R: CubeRuntime, const N: usize>(
     )
 }
 
+#[cfg(feature = "autotune")]
 pub fn conv_gemm_simple_async<R: CubeRuntime, const N: usize>(
     input: CubeTensor<R>,
     weight: CubeTensor<R>,
@@ -75,15 +46,15 @@ pub fn conv_gemm_simple_async<R: CubeRuntime, const N: usize>(
         AcceleratedTileKind::Cmma => ConvAlgorithm::SimpleAsyncCyclic,
         AcceleratedTileKind::Mma => ConvAlgorithm::SimpleAsyncStrided,
     };
-    launch_convolution_forward::<R, N>(
+    launch_convolution_forward_ref::<R, N>(
         &Strategy::Inferred {
             algorithm,
             tile_kind,
         },
-        input,
-        weight,
-        bias,
-        options,
+        &input,
+        &weight,
+        bias.as_ref(),
+        &options,
     )
 }
 
@@ -94,6 +65,7 @@ pub fn conv_gemm_simple_async<R: CubeRuntime, const N: usize>(
 /// * `weight` - The weights (filter) applied to each kernel
 /// * `bias` - The bias added to each channel
 /// * `options` - The options to use for the convolution
+#[cfg(feature = "autotune")]
 pub fn conv_gemm_simple_tma<R: CubeRuntime, const N: usize>(
     input: CubeTensor<R>,
     weight: CubeTensor<R>,
@@ -101,36 +73,19 @@ pub fn conv_gemm_simple_tma<R: CubeRuntime, const N: usize>(
     options: ConvOptions<N>,
     tile_kind: AcceleratedTileKind,
 ) -> Result<CubeTensor<R>, ConvSetupError> {
-    launch_convolution_forward::<R, N>(
+    launch_convolution_forward_ref::<R, N>(
         &Strategy::Inferred {
             algorithm: ConvAlgorithm::SimpleAsyncTma,
             tile_kind,
         },
-        input,
-        weight,
-        bias,
-        options,
+        &input,
+        &weight,
+        bias.as_ref(),
+        &options,
     )
 }
 
-/// Perform a 2D convolution using the implicit GEMM (im2col) algorithm, using cubecl tiling matmul
-/// components, using the specified algorithm.
-///
-/// * `input` - The input feature map
-/// * `weight` - The weights (filter) applied to each kernel
-/// * `bias` - The bias added to each channel
-/// * `options` - The options to use for the convolution
-pub fn launch_convolution_forward<R: CubeRuntime, const N: usize>(
-    strategy: &Strategy,
-    input: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    bias: Option<CubeTensor<R>>,
-    options: ConvOptions<N>,
-) -> Result<CubeTensor<R>, ConvSetupError> {
-    launch_convolution_forward_ref(strategy, &input, &weight, bias.as_ref(), &options)
-}
-
-/// Borrowing variant of [`launch_convolution_forward`].
+/// Launch a convolution using the specified implicit GEMM algorithm.
 pub fn launch_convolution_forward_ref<R: CubeRuntime, const N: usize>(
     strategy: &Strategy,
     input: &CubeTensor<R>,

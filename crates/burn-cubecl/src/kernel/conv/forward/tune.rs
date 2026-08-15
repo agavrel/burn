@@ -37,14 +37,36 @@ pub fn conv_autotune<R: CubeRuntime, const N: usize>(
             ))
             .with(Tunable::new(
                 "simple_sync_cmma",
-                |(input, weight, bias, options)| {
-                    conv_gemm_simple_sync(input, weight, bias, options, AcceleratedTileKind::Cmma)
+                |(input, weight, bias, options): (
+                    CubeTensor<R>,
+                    CubeTensor<R>,
+                    Option<CubeTensor<R>>,
+                    ConvOptions<N>,
+                )| {
+                    conv_gemm_simple_sync_ref::<R, N>(
+                        &input,
+                        &weight,
+                        bias.as_ref(),
+                        &options,
+                        AcceleratedTileKind::Cmma,
+                    )
                 },
             ))
             .with(Tunable::new(
                 "simple_sync_mma",
-                |(input, weight, bias, options)| {
-                    conv_gemm_simple_sync(input, weight, bias, options, AcceleratedTileKind::Mma)
+                |(input, weight, bias, options): (
+                    CubeTensor<R>,
+                    CubeTensor<R>,
+                    Option<CubeTensor<R>>,
+                    ConvOptions<N>,
+                )| {
+                    conv_gemm_simple_sync_ref::<R, N>(
+                        &input,
+                        &weight,
+                        bias.as_ref(),
+                        &options,
+                        AcceleratedTileKind::Mma,
+                    )
                 },
             ))
             .with(Tunable::new(

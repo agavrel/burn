@@ -1,9 +1,16 @@
 use crate::{
-    backend::{Dispatch, Metal, backend_extension, tensor::FloatTensor},
-    tensor::{Shape, Tensor as BurnTensor},
+    backend::{
+        Dispatch, Metal, backend_extension,
+        tensor::{FloatTensor, QuantizedTensor},
+    },
+    tensor::{DType, Shape, Tensor as BurnTensor},
 };
 use burn_cubecl::{CubeBackend, CubeRuntime, kernel::into_contiguous, tensor::CubeTensor};
-use cubecl::{CubeCount, CubeDim, cube, prelude::*};
+use cubecl::{
+    CubeCount, CubeDim, cube,
+    prelude::*,
+    quant::scheme::{QuantLevel, QuantMode, QuantParam, QuantScheme, QuantStore, QuantValue},
+};
 
 /// Transformer operations that collapse common inference-only operator chains.
 #[backend_extension(Metal)]
@@ -32,6 +39,16 @@ pub trait MetalTransformerBackend: crate::backend::Backend {
     fn fused_gemv_bias(
         input: FloatTensor<Self>,
         weight: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
+
+    /// Matrix-vector multiplication for packed block-Q8 `[input, output]` weights.
+    fn fused_q8_gemv(input: FloatTensor<Self>, weight: QuantizedTensor<Self>) -> FloatTensor<Self>;
+
+    /// Matrix-vector multiplication with packed block-Q8 weights and an output bias.
+    fn fused_q8_gemv_bias(
+        input: FloatTensor<Self>,
+        weight: QuantizedTensor<Self>,
         bias: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
 }
@@ -74,6 +91,22 @@ pub fn linear(
     weight: BurnTensor<2>,
     bias: Option<BurnTensor<1>>,
 ) -> BurnTensor<3> {
+    if let DType::QFloat(scheme) = weight.dtype() {
+        if q8_gemv_block_size(scheme).is_none() {
+            return crate::tensor::module::linear(input, weight, bias);
+        }
+
+        let output = match bias {
+            Some(bias) => Dispatch::fused_q8_gemv_bias(
+                input.into_dispatch(),
+                weight.into_dispatch(),
+                bias.into_dispatch(),
+            ),
+            None => Dispatch::fused_q8_gemv(input.into_dispatch(), weight.into_dispatch()),
+        };
+        return BurnTensor::from_dispatch(output);
+    }
+
     let output = match bias {
         Some(bias) => Dispatch::fused_gemv_bias(
             input.into_dispatch(),
@@ -83,6 +116,25 @@ pub fn linear(
         None => Dispatch::fused_gemv(input.into_dispatch(), weight.into_dispatch()),
     };
     BurnTensor::from_dispatch(output)
+}
+
+fn q8_gemv_block_size(scheme: QuantScheme) -> Option<usize> {
+    if !matches!(scheme.value, QuantValue::Q8F | QuantValue::Q8S)
+        || scheme.param != QuantParam::F32
+        || scheme.store != QuantStore::PackedU32(0)
+        || scheme.mode != QuantMode::Symmetric
+    {
+        return None;
+    }
+
+    let QuantLevel::Block(block_size) = scheme.level else {
+        return None;
+    };
+    let output = match block_size.as_slice() {
+        [output] | [1, output] => *output as usize,
+        _ => return None,
+    };
+    (output != 0 && output.is_multiple_of(4)).then_some(output)
 }
 
 #[cube(launch)]
@@ -216,6 +268,127 @@ fn gemv_bias_kernel<F: Float>(
     let sum = plane_sum(sum);
     if lane == 0 {
         output[output_index] = sum + bias[column_out];
+    }
+}
+
+/// One SIMD group computes the four outputs stored in one packed `u32`. Its 32
+/// lanes split the input dimension, then reduce four F32 accumulators. This
+/// keeps enough groups active during one-token decoding while reading every
+/// packed weight word only once.
+#[cube(launch)]
+fn q8_gemv_kernel<F: Float>(
+    input: &Tensor<F>,
+    weight: &Tensor<u32>,
+    scales: &Tensor<f32>,
+    output: &mut Tensor<F>,
+    output_width: u32,
+    block_size: u32,
+    #[define(F)] _dtype: StorageType,
+) {
+    let lane = UNIT_POS_X as usize;
+    let output_width = output_width as usize;
+    let block_size = block_size as usize;
+    let packed_output_width = output_width / 4;
+    let row = CUBE_POS_X as usize / packed_output_width;
+    let packed_column = CUBE_POS_X as usize % packed_output_width;
+    let output_column = packed_column * 4;
+    let input_width = weight.shape(0);
+    let scale_column = output_column / block_size;
+    let mut sum_0 = 0.0_f32;
+    let mut sum_1 = 0.0_f32;
+    let mut sum_2 = 0.0_f32;
+    let mut sum_3 = 0.0_f32;
+    let mut input_column = lane;
+
+    while input_column < input_width {
+        let packed = weight[input_column * weight.stride(0) + packed_column * weight.stride(1)];
+        let raw_0 = packed & 255u32;
+        let raw_1 = (packed >> 8u32) & 255u32;
+        let raw_2 = (packed >> 16u32) & 255u32;
+        let raw_3 = (packed >> 24u32) & 255u32;
+        let quant_0 = raw_0 as i32 - (raw_0 >= 128u32) as i32 * 256;
+        let quant_1 = raw_1 as i32 - (raw_1 >= 128u32) as i32 * 256;
+        let quant_2 = raw_2 as i32 - (raw_2 >= 128u32) as i32 * 256;
+        let quant_3 = raw_3 as i32 - (raw_3 >= 128u32) as i32 * 256;
+        let scale = scales[input_column * scales.stride(0) + scale_column * scales.stride(1)];
+        let value = f32::cast_from(input[row * input_width + input_column]) * scale;
+
+        sum_0 += value * f32::cast_from(quant_0);
+        sum_1 += value * f32::cast_from(quant_1);
+        sum_2 += value * f32::cast_from(quant_2);
+        sum_3 += value * f32::cast_from(quant_3);
+        input_column += CUBE_DIM_X as usize;
+    }
+
+    let sum_0 = plane_sum(sum_0);
+    let sum_1 = plane_sum(sum_1);
+    let sum_2 = plane_sum(sum_2);
+    let sum_3 = plane_sum(sum_3);
+    if lane == 0 {
+        let output_offset = row * output_width + output_column;
+        output[output_offset] = F::cast_from(sum_0);
+        output[output_offset + 1] = F::cast_from(sum_1);
+        output[output_offset + 2] = F::cast_from(sum_2);
+        output[output_offset + 3] = F::cast_from(sum_3);
+    }
+}
+
+#[cube(launch)]
+fn q8_gemv_bias_kernel<F: Float>(
+    input: &Tensor<F>,
+    weight: &Tensor<u32>,
+    scales: &Tensor<f32>,
+    bias: &Tensor<F>,
+    output: &mut Tensor<F>,
+    output_width: u32,
+    block_size: u32,
+    #[define(F)] _dtype: StorageType,
+) {
+    let lane = UNIT_POS_X as usize;
+    let output_width = output_width as usize;
+    let block_size = block_size as usize;
+    let packed_output_width = output_width / 4;
+    let row = CUBE_POS_X as usize / packed_output_width;
+    let packed_column = CUBE_POS_X as usize % packed_output_width;
+    let output_column = packed_column * 4;
+    let input_width = weight.shape(0);
+    let scale_column = output_column / block_size;
+    let mut sum_0 = 0.0_f32;
+    let mut sum_1 = 0.0_f32;
+    let mut sum_2 = 0.0_f32;
+    let mut sum_3 = 0.0_f32;
+    let mut input_column = lane;
+
+    while input_column < input_width {
+        let packed = weight[input_column * weight.stride(0) + packed_column * weight.stride(1)];
+        let raw_0 = packed & 255u32;
+        let raw_1 = (packed >> 8u32) & 255u32;
+        let raw_2 = (packed >> 16u32) & 255u32;
+        let raw_3 = (packed >> 24u32) & 255u32;
+        let quant_0 = raw_0 as i32 - (raw_0 >= 128u32) as i32 * 256;
+        let quant_1 = raw_1 as i32 - (raw_1 >= 128u32) as i32 * 256;
+        let quant_2 = raw_2 as i32 - (raw_2 >= 128u32) as i32 * 256;
+        let quant_3 = raw_3 as i32 - (raw_3 >= 128u32) as i32 * 256;
+        let scale = scales[input_column * scales.stride(0) + scale_column * scales.stride(1)];
+        let value = f32::cast_from(input[row * input_width + input_column]) * scale;
+
+        sum_0 += value * f32::cast_from(quant_0);
+        sum_1 += value * f32::cast_from(quant_1);
+        sum_2 += value * f32::cast_from(quant_2);
+        sum_3 += value * f32::cast_from(quant_3);
+        input_column += CUBE_DIM_X as usize;
+    }
+
+    let sum_0 = plane_sum(sum_0);
+    let sum_1 = plane_sum(sum_1);
+    let sum_2 = plane_sum(sum_2);
+    let sum_3 = plane_sum(sum_3);
+    if lane == 0 {
+        let output_offset = row * output_width + output_column;
+        output[output_offset] = F::cast_from(sum_0 + f32::cast_from(bias[output_column]));
+        output[output_offset + 1] = F::cast_from(sum_1 + f32::cast_from(bias[output_column + 1]));
+        output[output_offset + 2] = F::cast_from(sum_2 + f32::cast_from(bias[output_column + 2]));
+        output[output_offset + 3] = F::cast_from(sum_3 + f32::cast_from(bias[output_column + 3]));
     }
 }
 
@@ -370,6 +543,97 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
             weight.into_tensor_arg(),
             bias.into_tensor_arg(),
             output.clone().into_tensor_arg(),
+            crate::backend::cubecl::dtype_to_storage_type(input.dtype),
+        );
+        output
+    }
+
+    fn fused_q8_gemv(input: FloatTensor<Self>, weight: QuantizedTensor<Self>) -> FloatTensor<Self> {
+        input.assert_is_on_same_device(&weight);
+        let scheme = match weight.dtype {
+            DType::QFloat(scheme) => scheme,
+            dtype => panic!("Expected a quantized Q8 weight, got {dtype:?}"),
+        };
+        let block_size = q8_gemv_block_size(scheme)
+            .expect("Metal Q8 GEMV received an unsupported quantization scheme");
+        let input = into_contiguous(input);
+        let output = gemv_output(&input, &weight);
+        let input_width = weight.meta.shape()[0];
+        let output_width = weight.meta.shape()[1];
+        assert!(output_width.is_multiple_of(4));
+
+        let (values, scales) = weight
+            .quantized_handles()
+            .expect("Q8 weight must carry packed values and scales");
+        assert_eq!(values.dtype, DType::U32);
+        assert_eq!(values.meta.shape().dims(), [input_width, output_width / 4]);
+        assert_eq!(scales.dtype, DType::F32);
+        assert_eq!(
+            scales.meta.shape().dims(),
+            [input_width, output_width.div_ceil(block_size)]
+        );
+
+        let rows = input.meta.num_elements() / input_width;
+        q8_gemv_kernel::launch(
+            &input.client,
+            CubeCount::Static((rows * output_width / 4) as u32, 1, 1),
+            CubeDim::new_1d(32),
+            input.clone().into_tensor_arg(),
+            values.into_tensor_arg(),
+            scales.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            output_width as u32,
+            block_size as u32,
+            crate::backend::cubecl::dtype_to_storage_type(input.dtype),
+        );
+        output
+    }
+
+    fn fused_q8_gemv_bias(
+        input: FloatTensor<Self>,
+        weight: QuantizedTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        input.assert_is_on_same_device(&weight);
+        input.assert_is_on_same_device(&bias);
+        assert_eq!(input.dtype, bias.dtype);
+        let scheme = match weight.dtype {
+            DType::QFloat(scheme) => scheme,
+            dtype => panic!("Expected a quantized Q8 weight, got {dtype:?}"),
+        };
+        let block_size = q8_gemv_block_size(scheme)
+            .expect("Metal Q8 GEMV received an unsupported quantization scheme");
+        let input = into_contiguous(input);
+        let bias = into_contiguous(bias);
+        let output = gemv_output(&input, &weight);
+        let input_width = weight.meta.shape()[0];
+        let output_width = weight.meta.shape()[1];
+        assert!(output_width.is_multiple_of(4));
+        assert_eq!(bias.meta.num_elements(), output_width);
+
+        let (values, scales) = weight
+            .quantized_handles()
+            .expect("Q8 weight must carry packed values and scales");
+        assert_eq!(values.dtype, DType::U32);
+        assert_eq!(values.meta.shape().dims(), [input_width, output_width / 4]);
+        assert_eq!(scales.dtype, DType::F32);
+        assert_eq!(
+            scales.meta.shape().dims(),
+            [input_width, output_width.div_ceil(block_size)]
+        );
+
+        let rows = input.meta.num_elements() / input_width;
+        q8_gemv_bias_kernel::launch(
+            &input.client,
+            CubeCount::Static((rows * output_width / 4) as u32, 1, 1),
+            CubeDim::new_1d(32),
+            input.clone().into_tensor_arg(),
+            values.into_tensor_arg(),
+            scales.into_tensor_arg(),
+            bias.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            output_width as u32,
+            block_size as u32,
             crate::backend::cubecl::dtype_to_storage_type(input.dtype),
         );
         output
