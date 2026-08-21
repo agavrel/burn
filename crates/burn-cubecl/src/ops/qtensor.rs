@@ -20,6 +20,14 @@ use crate::{
 
 use super::{into_data, permute, swap_dims};
 
+fn requires_dequantized_matmul(scheme: QuantScheme) -> bool {
+    scheme.value == QuantValue::Q4S
+        && scheme.param == QuantParam::F32
+        && scheme.store == QuantStore::PackedU32(0)
+        && scheme.mode == QuantMode::Symmetric
+        && matches!(scheme.level, QuantLevel::Block(block) if block.as_dim::<2>()[1] == 1)
+}
+
 /// Create a quantized tensor with packed values (u32).
 fn new_qtensor_optimized<R: CubeRuntime>(
     data: Bytes,
@@ -267,11 +275,25 @@ impl<R: CubeRuntime> QTensorOps<Self> for CubeBackend<R> {
 
         let (_lhs_dtype, lhs) = match lhs {
             TensorPrimitive::Float(lhs) => (lhs.dtype, lhs),
-            TensorPrimitive::QFloat(lhs) => (out_dtype, lhs),
+            TensorPrimitive::QFloat(lhs) => {
+                let lhs = if requires_dequantized_matmul(lhs.scheme()) {
+                    kernel::quantization::dequantize(lhs, out_dtype)
+                } else {
+                    lhs
+                };
+                (out_dtype, lhs)
+            }
         };
         let (_rhs_dtype, rhs) = match rhs {
             TensorPrimitive::Float(rhs) => (rhs.dtype, rhs),
-            TensorPrimitive::QFloat(rhs) => (out_dtype, rhs),
+            TensorPrimitive::QFloat(rhs) => {
+                let rhs = if requires_dequantized_matmul(rhs.scheme()) {
+                    kernel::quantization::dequantize(rhs, out_dtype)
+                } else {
+                    rhs
+                };
+                (out_dtype, rhs)
+            }
         };
 
         let out =

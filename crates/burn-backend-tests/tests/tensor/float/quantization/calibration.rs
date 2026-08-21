@@ -58,6 +58,37 @@ fn min_max_calibration_range_per_block() {
         .assert_eq(&TensorData::from([[0.5], [1.8], [0.04], [-0.01]]), false);
 }
 
+#[test]
+fn min_max_calibration_range_per_multidimensional_block() {
+    let device = Default::default();
+    let tensor = TestTensor::<2>::from_data(
+        [
+            [1.0, 10.0, 100.0],
+            [2.0, 20.0, 200.0],
+            [3.0, 30.0, 300.0],
+            [4.0, 40.0, 400.0],
+        ],
+        &device,
+    );
+    let scheme = device
+        .settings()
+        .quantization
+        .scheme
+        .with_value(QuantValue::Q4S)
+        .with_level(QuantLevel::block([2, 1]));
+
+    let range = compute_range(&scheme, &tensor, &Calibration::MinMax);
+
+    range.min.into_data().assert_eq(
+        &TensorData::from([[1.0, 10.0, 100.0], [3.0, 30.0, 300.0]]),
+        false,
+    );
+    range.max.into_data().assert_eq(
+        &TensorData::from([[2.0, 20.0, 200.0], [4.0, 40.0, 400.0]]),
+        false,
+    );
+}
+
 // abs-mean calibration: gamma = mean(|W|), range = [-gamma, +gamma]
 // weights: [-0.9, -0.3, 0.0, 0.6]  => mean(|w|) = (0.9+0.3+0.0+0.6)/4 = 0.45
 #[test]

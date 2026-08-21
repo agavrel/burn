@@ -20,6 +20,18 @@ pub enum ParamGroupError {
     InvalidPatternError(String),
 }
 
+impl core::fmt::Display for ParamGroupError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidPatternError(message) => {
+                write!(formatter, "invalid regex pattern: {message}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for ParamGroupError {}
+
 #[derive(Default)]
 struct ParamIdCollector {
     ids: Vec<ParamId>,
@@ -154,9 +166,7 @@ impl ParamGroup {
             match Regex::new(pattern.as_ref()) {
                 Ok(re) => new_patterns.push(re),
                 Err(e) => {
-                    return Err(ParamGroupError::InvalidPatternError(format!(
-                        "Invalid regex pattern: {e}"
-                    )));
+                    return Err(ParamGroupError::InvalidPatternError(e.to_string()));
                 }
             }
         }
@@ -182,9 +192,7 @@ impl ParamGroup {
                     ]))))
                 }
                 Err(e) => {
-                    return Err(ParamGroupError::InvalidPatternError(format!(
-                        "Invalid regex pattern: {e}"
-                    )));
+                    return Err(ParamGroupError::InvalidPatternError(e.to_string()));
                 }
             }
         }
@@ -541,5 +549,13 @@ mod tests {
 
         let result = ParamGroup::from_any_regexes(vec![r"[invalid("]);
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn invalid_pattern_error_has_a_user_facing_message() {
+        let error = ParamGroup::from_regex(r"[invalid(").unwrap_err();
+
+        assert!(error.to_string().starts_with("invalid regex pattern:"));
     }
 }

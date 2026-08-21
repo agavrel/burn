@@ -2,4 +2,7 @@
 
 mod transformer;
 
-pub use transformer::{apply_rope, linear, rms_norm, silu_mul};
+pub use transformer::{
+    apply_rope, embedding, embedding_projection, embedding_row, linear, linear_prefix, rms_norm,
+    sample_topk, silu_mul,
+};
