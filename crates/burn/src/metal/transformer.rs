@@ -899,6 +899,179 @@ fn q4_gemv_kernel<F: Float>(
     }
 }
 
+/// One SIMD group computes two adjacent packed Q4 words. This halves repeated
+/// activation reads for the production matrices whose output width is a
+/// multiple of sixteen.
+#[cube(launch)]
+fn q4_gemv_wide_kernel<F: Float>(
+    input: &Tensor<F>,
+    weight: &Tensor<u32>,
+    scales: &Tensor<f32>,
+    bias: &Tensor<F>,
+    output: &mut Tensor<F>,
+    output_width: u32,
+    block_size: u32,
+    #[comptime] has_bias: bool,
+    #[define(F)] _dtype: StorageType,
+) {
+    let lane = UNIT_POS_X as usize;
+    let output_width = output_width as usize;
+    let block_size = block_size as usize;
+    let output_groups = output_width / 16;
+    let row = CUBE_POS_X as usize / output_groups;
+    let output_group = CUBE_POS_X as usize % output_groups;
+    let packed_column = output_group * 2;
+    let output_column = output_group * 16;
+    let input_width = weight.shape(0);
+    let mut sum_0 = 0.0_f32;
+    let mut sum_1 = 0.0_f32;
+    let mut sum_2 = 0.0_f32;
+    let mut sum_3 = 0.0_f32;
+    let mut sum_4 = 0.0_f32;
+    let mut sum_5 = 0.0_f32;
+    let mut sum_6 = 0.0_f32;
+    let mut sum_7 = 0.0_f32;
+    let mut sum_8 = 0.0_f32;
+    let mut sum_9 = 0.0_f32;
+    let mut sum_10 = 0.0_f32;
+    let mut sum_11 = 0.0_f32;
+    let mut sum_12 = 0.0_f32;
+    let mut sum_13 = 0.0_f32;
+    let mut sum_14 = 0.0_f32;
+    let mut sum_15 = 0.0_f32;
+    let mut input_column = lane;
+
+    while input_column < input_width {
+        let weight_offset = input_column * weight.stride(0) + packed_column * weight.stride(1);
+        let packed_0 = weight[weight_offset];
+        let packed_1 = weight[weight_offset + weight.stride(1)];
+        let raw_0 = packed_0 & 15u32;
+        let raw_1 = (packed_0 >> 4u32) & 15u32;
+        let raw_2 = (packed_0 >> 8u32) & 15u32;
+        let raw_3 = (packed_0 >> 12u32) & 15u32;
+        let raw_4 = (packed_0 >> 16u32) & 15u32;
+        let raw_5 = (packed_0 >> 20u32) & 15u32;
+        let raw_6 = (packed_0 >> 24u32) & 15u32;
+        let raw_7 = (packed_0 >> 28u32) & 15u32;
+        let raw_8 = packed_1 & 15u32;
+        let raw_9 = (packed_1 >> 4u32) & 15u32;
+        let raw_10 = (packed_1 >> 8u32) & 15u32;
+        let raw_11 = (packed_1 >> 12u32) & 15u32;
+        let raw_12 = (packed_1 >> 16u32) & 15u32;
+        let raw_13 = (packed_1 >> 20u32) & 15u32;
+        let raw_14 = (packed_1 >> 24u32) & 15u32;
+        let raw_15 = (packed_1 >> 28u32) & 15u32;
+        let quant_0 = raw_0 as i32 - (raw_0 >= 8u32) as i32 * 16;
+        let quant_1 = raw_1 as i32 - (raw_1 >= 8u32) as i32 * 16;
+        let quant_2 = raw_2 as i32 - (raw_2 >= 8u32) as i32 * 16;
+        let quant_3 = raw_3 as i32 - (raw_3 >= 8u32) as i32 * 16;
+        let quant_4 = raw_4 as i32 - (raw_4 >= 8u32) as i32 * 16;
+        let quant_5 = raw_5 as i32 - (raw_5 >= 8u32) as i32 * 16;
+        let quant_6 = raw_6 as i32 - (raw_6 >= 8u32) as i32 * 16;
+        let quant_7 = raw_7 as i32 - (raw_7 >= 8u32) as i32 * 16;
+        let quant_8 = raw_8 as i32 - (raw_8 >= 8u32) as i32 * 16;
+        let quant_9 = raw_9 as i32 - (raw_9 >= 8u32) as i32 * 16;
+        let quant_10 = raw_10 as i32 - (raw_10 >= 8u32) as i32 * 16;
+        let quant_11 = raw_11 as i32 - (raw_11 >= 8u32) as i32 * 16;
+        let quant_12 = raw_12 as i32 - (raw_12 >= 8u32) as i32 * 16;
+        let quant_13 = raw_13 as i32 - (raw_13 >= 8u32) as i32 * 16;
+        let quant_14 = raw_14 as i32 - (raw_14 >= 8u32) as i32 * 16;
+        let quant_15 = raw_15 as i32 - (raw_15 >= 8u32) as i32 * 16;
+        let scale_row = input_column / block_size;
+        let scale_offset = scale_row * scales.stride(0) + output_column * scales.stride(1);
+        let scale_stride = scales.stride(1);
+        let value = f32::cast_from(input[row * input_width + input_column]);
+
+        sum_0 += value * scales[scale_offset] * f32::cast_from(quant_0);
+        sum_1 += value * scales[scale_offset + scale_stride] * f32::cast_from(quant_1);
+        sum_2 += value * scales[scale_offset + 2 * scale_stride] * f32::cast_from(quant_2);
+        sum_3 += value * scales[scale_offset + 3 * scale_stride] * f32::cast_from(quant_3);
+        sum_4 += value * scales[scale_offset + 4 * scale_stride] * f32::cast_from(quant_4);
+        sum_5 += value * scales[scale_offset + 5 * scale_stride] * f32::cast_from(quant_5);
+        sum_6 += value * scales[scale_offset + 6 * scale_stride] * f32::cast_from(quant_6);
+        sum_7 += value * scales[scale_offset + 7 * scale_stride] * f32::cast_from(quant_7);
+        sum_8 += value * scales[scale_offset + 8 * scale_stride] * f32::cast_from(quant_8);
+        sum_9 += value * scales[scale_offset + 9 * scale_stride] * f32::cast_from(quant_9);
+        sum_10 += value * scales[scale_offset + 10 * scale_stride] * f32::cast_from(quant_10);
+        sum_11 += value * scales[scale_offset + 11 * scale_stride] * f32::cast_from(quant_11);
+        sum_12 += value * scales[scale_offset + 12 * scale_stride] * f32::cast_from(quant_12);
+        sum_13 += value * scales[scale_offset + 13 * scale_stride] * f32::cast_from(quant_13);
+        sum_14 += value * scales[scale_offset + 14 * scale_stride] * f32::cast_from(quant_14);
+        sum_15 += value * scales[scale_offset + 15 * scale_stride] * f32::cast_from(quant_15);
+        input_column += CUBE_DIM_X as usize;
+    }
+
+    let sum_0 = plane_sum(sum_0);
+    let sum_1 = plane_sum(sum_1);
+    let sum_2 = plane_sum(sum_2);
+    let sum_3 = plane_sum(sum_3);
+    let sum_4 = plane_sum(sum_4);
+    let sum_5 = plane_sum(sum_5);
+    let sum_6 = plane_sum(sum_6);
+    let sum_7 = plane_sum(sum_7);
+    let sum_8 = plane_sum(sum_8);
+    let sum_9 = plane_sum(sum_9);
+    let sum_10 = plane_sum(sum_10);
+    let sum_11 = plane_sum(sum_11);
+    let sum_12 = plane_sum(sum_12);
+    let sum_13 = plane_sum(sum_13);
+    let sum_14 = plane_sum(sum_14);
+    let sum_15 = plane_sum(sum_15);
+    if lane == 0 {
+        let output_offset = row * output_width + output_column;
+        if has_bias {
+            output[output_offset] = F::cast_from(sum_0 + f32::cast_from(bias[output_column]));
+            output[output_offset + 1] =
+                F::cast_from(sum_1 + f32::cast_from(bias[output_column + 1]));
+            output[output_offset + 2] =
+                F::cast_from(sum_2 + f32::cast_from(bias[output_column + 2]));
+            output[output_offset + 3] =
+                F::cast_from(sum_3 + f32::cast_from(bias[output_column + 3]));
+            output[output_offset + 4] =
+                F::cast_from(sum_4 + f32::cast_from(bias[output_column + 4]));
+            output[output_offset + 5] =
+                F::cast_from(sum_5 + f32::cast_from(bias[output_column + 5]));
+            output[output_offset + 6] =
+                F::cast_from(sum_6 + f32::cast_from(bias[output_column + 6]));
+            output[output_offset + 7] =
+                F::cast_from(sum_7 + f32::cast_from(bias[output_column + 7]));
+            output[output_offset + 8] =
+                F::cast_from(sum_8 + f32::cast_from(bias[output_column + 8]));
+            output[output_offset + 9] =
+                F::cast_from(sum_9 + f32::cast_from(bias[output_column + 9]));
+            output[output_offset + 10] =
+                F::cast_from(sum_10 + f32::cast_from(bias[output_column + 10]));
+            output[output_offset + 11] =
+                F::cast_from(sum_11 + f32::cast_from(bias[output_column + 11]));
+            output[output_offset + 12] =
+                F::cast_from(sum_12 + f32::cast_from(bias[output_column + 12]));
+            output[output_offset + 13] =
+                F::cast_from(sum_13 + f32::cast_from(bias[output_column + 13]));
+            output[output_offset + 14] =
+                F::cast_from(sum_14 + f32::cast_from(bias[output_column + 14]));
+            output[output_offset + 15] =
+                F::cast_from(sum_15 + f32::cast_from(bias[output_column + 15]));
+        } else {
+            output[output_offset] = F::cast_from(sum_0);
+            output[output_offset + 1] = F::cast_from(sum_1);
+            output[output_offset + 2] = F::cast_from(sum_2);
+            output[output_offset + 3] = F::cast_from(sum_3);
+            output[output_offset + 4] = F::cast_from(sum_4);
+            output[output_offset + 5] = F::cast_from(sum_5);
+            output[output_offset + 6] = F::cast_from(sum_6);
+            output[output_offset + 7] = F::cast_from(sum_7);
+            output[output_offset + 8] = F::cast_from(sum_8);
+            output[output_offset + 9] = F::cast_from(sum_9);
+            output[output_offset + 10] = F::cast_from(sum_10);
+            output[output_offset + 11] = F::cast_from(sum_11);
+            output[output_offset + 12] = F::cast_from(sum_12);
+            output[output_offset + 13] = F::cast_from(sum_13);
+            output[output_offset + 14] = F::cast_from(sum_14);
+            output[output_offset + 15] = F::cast_from(sum_15);
+        }
+    }
+}
+
 #[cube(launch)]
 fn q4_gemv_bias_kernel<F: Float>(
     input: &Tensor<F>,
@@ -1704,6 +1877,23 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
         );
 
         let rows = input.meta.num_elements() / input_width;
+        if output_width.is_multiple_of(16) {
+            q4_gemv_wide_kernel::launch(
+                &input.client,
+                CubeCount::Static((rows * output_width / 16) as u32, 1, 1),
+                CubeDim::new_1d(32),
+                input.clone().into_tensor_arg(),
+                values.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                input.clone().into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                output_width as u32,
+                block_size as u32,
+                false,
+                crate::backend::cubecl::dtype_to_storage_type(input.dtype),
+            );
+            return output;
+        }
         q4_gemv_kernel::launch(
             &input.client,
             CubeCount::Static((rows * output_width / 8) as u32, 1, 1),
@@ -1754,6 +1944,23 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
         );
 
         let rows = input.meta.num_elements() / input_width;
+        if output_width.is_multiple_of(16) {
+            q4_gemv_wide_kernel::launch(
+                &input.client,
+                CubeCount::Static((rows * output_width / 16) as u32, 1, 1),
+                CubeDim::new_1d(32),
+                input.clone().into_tensor_arg(),
+                values.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                bias.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                output_width as u32,
+                block_size as u32,
+                true,
+                crate::backend::cubecl::dtype_to_storage_type(input.dtype),
+            );
+            return output;
+        }
         q4_gemv_bias_kernel::launch(
             &input.client,
             CubeCount::Static((rows * output_width / 8) as u32, 1, 1),
