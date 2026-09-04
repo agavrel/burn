@@ -32,6 +32,13 @@ pub trait MetalTransformerBackend: crate::backend::Backend {
         sequence_dim: u32,
     ) -> FloatTensor<Self>;
 
+    /// Single-token grouped-query attention without materializing repeated KV heads.
+    fn fused_grouped_query_attention_decode(
+        query: FloatTensor<Self>,
+        key: FloatTensor<Self>,
+        value: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
+
     /// Matrix-vector multiplication for row-major `[input, output]` weights.
     fn fused_gemv(
         input: FloatTensor<Self>,
@@ -133,6 +140,19 @@ pub fn apply_rope(
         input.into_dispatch(),
         frequencies.into_dispatch(),
         sequence_dim as u32,
+    ))
+}
+
+/// Computes single-token grouped-query attention directly from compact KV heads.
+pub fn grouped_query_attention_decode(
+    query: BurnTensor<4>,
+    key: BurnTensor<4>,
+    value: BurnTensor<4>,
+) -> BurnTensor<4> {
+    BurnTensor::from_dispatch(Dispatch::fused_grouped_query_attention_decode(
+        query.into_dispatch(),
+        key.into_dispatch(),
+        value.into_dispatch(),
     ))
 }
 
@@ -451,6 +471,115 @@ fn rope_kernel<F: Float>(
     } else {
         odd * cosine + even * sine
     };
+}
+
+/// Computes one of eight online-softmax shards for an Audio8 query head.
+#[cube(launch)]
+fn grouped_query_attention_decode_partial_kernel<F: Float, A: Float>(
+    query: &Tensor<F>,
+    key: &Tensor<F>,
+    value: &Tensor<F>,
+    partials: &mut Tensor<A>,
+    #[define(F, A)] _dtypes: [StorageType; 2],
+) {
+    let lane = UNIT_POS_X % 32;
+    let partial = CUBE_POS_X as usize % 8;
+    let query_index = CUBE_POS_X as usize / 8;
+    let query_head = query_index % query.shape(1);
+    let batch = query_index / query.shape(1);
+    let repeats = query.shape(1) / key.shape(1);
+    let kv_head = query_head / repeats;
+    let length = key.shape(2);
+    let head_dim = query.shape(3);
+    let feature_0 = lane as usize;
+    let feature_1 = feature_0 + 32;
+    let query_base = batch * query.stride(0) + query_head * query.stride(1);
+    let key_base = batch * key.stride(0) + kv_head * key.stride(1);
+    let value_base = batch * value.stride(0) + kv_head * value.stride(1);
+    let query_0 = A::cast_from(query[query_base + feature_0 * query.stride(3)]);
+    let query_1 = A::cast_from(query[query_base + feature_1 * query.stride(3)]);
+    let scale = A::new(1.0_f32) / A::cast_from(head_dim as u32).sqrt();
+    let mut local_max = A::new(-3.0e38_f32);
+    let mut local_sum = A::new(0.0_f32);
+    let mut local_output_0 = A::new(0.0_f32);
+    let mut local_output_1 = A::new(0.0_f32);
+    let mut position = partial;
+
+    while position < length {
+        let key_position = key_base + position * key.stride(2);
+        let score = query_0 * A::cast_from(key[key_position + feature_0 * key.stride(3)])
+            + query_1 * A::cast_from(key[key_position + feature_1 * key.stride(3)]);
+        let score = plane_sum(score) * scale;
+        if score > local_max {
+            let previous_scale = (local_max - score).exp();
+            local_output_0 *= previous_scale;
+            local_output_1 *= previous_scale;
+            local_sum *= previous_scale;
+            local_max = score;
+        }
+        let position_scale = (score - local_max).exp();
+        let value_position = value_base + position * value.stride(2);
+        local_output_0 +=
+            A::cast_from(value[value_position + feature_0 * value.stride(3)]) * position_scale;
+        local_output_1 +=
+            A::cast_from(value[value_position + feature_1 * value.stride(3)]) * position_scale;
+        local_sum += position_scale;
+        position += 8;
+    }
+
+    let partial_base =
+        batch * partials.stride(0) + query_head * partials.stride(1) + partial * partials.stride(2);
+    let partial_stride = partials.stride(3);
+    if lane == 0 {
+        partials[partial_base] = local_max;
+        partials[partial_base + partial_stride] = local_sum;
+    }
+    partials[partial_base + (feature_0 + 2) * partial_stride] = local_output_0;
+    partials[partial_base + (feature_1 + 2) * partial_stride] = local_output_1;
+}
+
+/// Merges the eight online-softmax shards after the partial dispatch.
+#[cube(launch)]
+fn grouped_query_attention_decode_merge_kernel<F: Float, A: Float>(
+    partials: &Tensor<A>,
+    output: &mut Tensor<F>,
+    #[define(F, A)] _dtypes: [StorageType; 2],
+) {
+    let lane = UNIT_POS_X % 32;
+    let query_head = CUBE_POS_X as usize % output.shape(1);
+    let batch = CUBE_POS_X as usize / output.shape(1);
+    let feature_0 = lane as usize;
+    let feature_1 = feature_0 + 32;
+    let partial_base = batch * partials.stride(0) + query_head * partials.stride(1);
+    let partial_stride = partials.stride(2);
+    let value_stride = partials.stride(3);
+    let mut maximum = partials[partial_base];
+    let mut partial = 1usize;
+    while partial < 8 {
+        let candidate = partials[partial_base + partial * partial_stride];
+        if candidate > maximum {
+            maximum = candidate;
+        }
+        partial += 1;
+    }
+
+    let mut denominator = A::new(0.0_f32);
+    let mut numerator_0 = A::new(0.0_f32);
+    let mut numerator_1 = A::new(0.0_f32);
+    partial = 0;
+    while partial < 8 {
+        let base = partial_base + partial * partial_stride;
+        let merge_scale = (partials[base] - maximum).exp();
+        denominator += partials[base + value_stride] * merge_scale;
+        numerator_0 += partials[base + (feature_0 + 2) * value_stride] * merge_scale;
+        numerator_1 += partials[base + (feature_1 + 2) * value_stride] * merge_scale;
+        partial += 1;
+    }
+
+    let output_stride = output.stride(3);
+    let output_base = batch * output.stride(0) + query_head * output.stride(1);
+    output[output_base + feature_0 * output_stride] = F::cast_from(numerator_0 / denominator);
+    output[output_base + feature_1 * output_stride] = F::cast_from(numerator_1 / denominator);
 }
 
 #[cube(launch)]
@@ -1257,6 +1386,66 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
             output.clone().into_tensor_arg(),
             sequence_dim,
             crate::backend::cubecl::dtype_to_storage_type(input.dtype),
+        );
+        output
+    }
+
+    fn fused_grouped_query_attention_decode(
+        query: FloatTensor<Self>,
+        key: FloatTensor<Self>,
+        value: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        query.assert_is_on_same_device(&key);
+        query.assert_is_on_same_device(&value);
+        assert_eq!(query.dtype, key.dtype);
+        assert_eq!(query.dtype, value.dtype);
+        assert_eq!(query.meta.num_dims(), 4);
+        assert_eq!(key.meta.num_dims(), 4);
+        assert_eq!(value.meta.num_dims(), 4);
+        assert_eq!(query.meta.shape()[0], key.meta.shape()[0]);
+        assert_eq!(key.meta.shape(), value.meta.shape());
+        assert_eq!(query.meta.shape()[2], 1);
+        assert_eq!(query.meta.shape()[3], 64);
+        assert_eq!(key.meta.shape()[3], 64);
+        assert!(key.meta.shape()[2] >= 8);
+        assert!(key.meta.shape()[1] > 0);
+        assert!(query.meta.shape()[1].is_multiple_of(key.meta.shape()[1]));
+        let output = empty_like(&query);
+        let cubes = query.meta.shape()[0] * query.meta.shape()[1];
+        let partial_shape = Shape::new([query.meta.shape()[0], query.meta.shape()[1], 8, 66]);
+        let partial_handle = query
+            .client
+            .empty(partial_shape.num_elements() * DType::F32.size());
+        let partials = CubeTensor::new_contiguous(
+            query.client.clone(),
+            query.device.clone(),
+            partial_shape,
+            partial_handle,
+            DType::F32,
+        );
+        grouped_query_attention_decode_partial_kernel::launch(
+            &query.client,
+            CubeCount::Static((cubes * 8) as u32, 1, 1),
+            CubeDim::new_1d(32),
+            query.clone().into_tensor_arg(),
+            key.into_tensor_arg(),
+            value.into_tensor_arg(),
+            partials.clone().into_tensor_arg(),
+            [
+                crate::backend::cubecl::dtype_to_storage_type(query.dtype),
+                crate::backend::cubecl::dtype_to_storage_type(DType::F32),
+            ],
+        );
+        grouped_query_attention_decode_merge_kernel::launch(
+            &query.client,
+            CubeCount::Static(cubes as u32, 1, 1),
+            CubeDim::new_1d(32),
+            partials.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            [
+                crate::backend::cubecl::dtype_to_storage_type(query.dtype),
+                crate::backend::cubecl::dtype_to_storage_type(DType::F32),
+            ],
         );
         output
     }
