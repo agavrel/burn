@@ -473,7 +473,65 @@ fn rope_kernel<F: Float>(
     };
 }
 
-/// Computes one of eight online-softmax shards for an Audio8 query head.
+/// Computes short-context attention for one Audio8 query head in one SIMD group.
+#[cube(launch)]
+fn grouped_query_attention_decode_short_kernel<F: Float, A: Float>(
+    query: &Tensor<F>,
+    key: &Tensor<F>,
+    value: &Tensor<F>,
+    output: &mut Tensor<F>,
+    #[define(F, A)] _dtypes: [StorageType; 2],
+) {
+    let lane = UNIT_POS_X % 32;
+    let query_head = CUBE_POS_X as usize % query.shape(1);
+    let batch = CUBE_POS_X as usize / query.shape(1);
+    let repeats = query.shape(1) / key.shape(1);
+    let kv_head = query_head / repeats;
+    let length = key.shape(2);
+    let head_dim = query.shape(3);
+    let feature_0 = lane as usize;
+    let feature_1 = feature_0 + 32;
+    let query_base = batch * query.stride(0) + query_head * query.stride(1);
+    let key_base = batch * key.stride(0) + kv_head * key.stride(1);
+    let value_base = batch * value.stride(0) + kv_head * value.stride(1);
+    let query_0 = A::cast_from(query[query_base + feature_0 * query.stride(3)]);
+    let query_1 = A::cast_from(query[query_base + feature_1 * query.stride(3)]);
+    let scale = A::new(1.0_f32) / A::cast_from(head_dim as u32).sqrt();
+    let mut local_max = A::new(-3.0e38_f32);
+    let mut local_sum = A::new(0.0_f32);
+    let mut local_output_0 = A::new(0.0_f32);
+    let mut local_output_1 = A::new(0.0_f32);
+    let mut position = 0usize;
+
+    while position < length {
+        let key_position = key_base + position * key.stride(2);
+        let score = query_0 * A::cast_from(key[key_position + feature_0 * key.stride(3)])
+            + query_1 * A::cast_from(key[key_position + feature_1 * key.stride(3)]);
+        let score = plane_sum(score) * scale;
+        if score > local_max {
+            let previous_scale = (local_max - score).exp();
+            local_output_0 *= previous_scale;
+            local_output_1 *= previous_scale;
+            local_sum *= previous_scale;
+            local_max = score;
+        }
+        let position_scale = (score - local_max).exp();
+        let value_position = value_base + position * value.stride(2);
+        local_output_0 +=
+            A::cast_from(value[value_position + feature_0 * value.stride(3)]) * position_scale;
+        local_output_1 +=
+            A::cast_from(value[value_position + feature_1 * value.stride(3)]) * position_scale;
+        local_sum += position_scale;
+        position += 1;
+    }
+
+    let output_stride = output.stride(3);
+    let output_base = batch * output.stride(0) + query_head * output.stride(1);
+    output[output_base + feature_0 * output_stride] = F::cast_from(local_output_0 / local_sum);
+    output[output_base + feature_1 * output_stride] = F::cast_from(local_output_1 / local_sum);
+}
+
+/// Computes one of eight online-softmax shards for a long Audio8 query head.
 #[cube(launch)]
 fn grouped_query_attention_decode_partial_kernel<F: Float, A: Float>(
     query: &Tensor<F>,
@@ -1407,11 +1465,28 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
         assert_eq!(query.meta.shape()[2], 1);
         assert_eq!(query.meta.shape()[3], 64);
         assert_eq!(key.meta.shape()[3], 64);
-        assert!(key.meta.shape()[2] >= 8);
+        assert!(key.meta.shape()[2] > 0);
         assert!(key.meta.shape()[1] > 0);
         assert!(query.meta.shape()[1].is_multiple_of(key.meta.shape()[1]));
         let output = empty_like(&query);
         let cubes = query.meta.shape()[0] * query.meta.shape()[1];
+        let dtypes = [
+            crate::backend::cubecl::dtype_to_storage_type(query.dtype),
+            crate::backend::cubecl::dtype_to_storage_type(DType::F32),
+        ];
+        if key.meta.shape()[2] < 128 {
+            grouped_query_attention_decode_short_kernel::launch(
+                &query.client,
+                CubeCount::Static(cubes as u32, 1, 1),
+                CubeDim::new_1d(32),
+                query.clone().into_tensor_arg(),
+                key.into_tensor_arg(),
+                value.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                dtypes,
+            );
+            return output;
+        }
         let partial_shape = Shape::new([query.meta.shape()[0], query.meta.shape()[1], 8, 66]);
         let partial_handle = query
             .client
@@ -1431,10 +1506,7 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
             key.into_tensor_arg(),
             value.into_tensor_arg(),
             partials.clone().into_tensor_arg(),
-            [
-                crate::backend::cubecl::dtype_to_storage_type(query.dtype),
-                crate::backend::cubecl::dtype_to_storage_type(DType::F32),
-            ],
+            dtypes,
         );
         grouped_query_attention_decode_merge_kernel::launch(
             &query.client,
@@ -1442,10 +1514,7 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
             CubeDim::new_1d(32),
             partials.into_tensor_arg(),
             output.clone().into_tensor_arg(),
-            [
-                crate::backend::cubecl::dtype_to_storage_type(query.dtype),
-                crate::backend::cubecl::dtype_to_storage_type(DType::F32),
-            ],
+            dtypes,
         );
         output
     }
