@@ -143,7 +143,11 @@ pub fn apply_rope(
     ))
 }
 
-/// Computes single-token grouped-query attention directly from compact KV heads.
+/// Head widths [`grouped_query_attention_decode`] supports: 64 (Audio8) and 128 (Qwen3-TTS).
+pub const GROUPED_QUERY_ATTENTION_DECODE_HEAD_DIMS: [usize; 2] = [64, 128];
+
+/// Computes single-token grouped-query attention directly from compact KV heads, for the
+/// head widths in [`GROUPED_QUERY_ATTENTION_DECODE_HEAD_DIMS`].
 pub fn grouped_query_attention_decode(
     query: BurnTensor<4>,
     key: BurnTensor<4>,
@@ -473,13 +477,17 @@ fn rope_kernel<F: Float>(
     };
 }
 
-/// Computes short-context attention for one Audio8 query head in one SIMD group.
+/// Computes short-context attention for one query head in one SIMD group. Each of the 32
+/// lanes owns features `lane` and `lane + 32` (head width 64, Audio8); a `wide` launch also
+/// gives it `lane + 64` and `lane + 96` (head width 128, Qwen3-TTS). The 64-wide arithmetic
+/// is the same either way: the extra features are compiled in only for `wide`.
 #[cube(launch)]
 fn grouped_query_attention_decode_short_kernel<F: Float, A: Float>(
     query: &Tensor<F>,
     key: &Tensor<F>,
     value: &Tensor<F>,
     output: &mut Tensor<F>,
+    #[comptime] wide: bool,
     #[define(F, A)] _dtypes: [StorageType; 2],
 ) {
     let lane = UNIT_POS_X % 32;
@@ -491,27 +499,45 @@ fn grouped_query_attention_decode_short_kernel<F: Float, A: Float>(
     let head_dim = query.shape(3);
     let feature_0 = lane as usize;
     let feature_1 = feature_0 + 32;
+    let feature_2 = feature_0 + 64;
+    let feature_3 = feature_0 + 96;
     let query_base = batch * query.stride(0) + query_head * query.stride(1);
     let key_base = batch * key.stride(0) + kv_head * key.stride(1);
     let value_base = batch * value.stride(0) + kv_head * value.stride(1);
     let query_0 = A::cast_from(query[query_base + feature_0 * query.stride(3)]);
     let query_1 = A::cast_from(query[query_base + feature_1 * query.stride(3)]);
+    let mut query_2 = A::new(0.0_f32);
+    let mut query_3 = A::new(0.0_f32);
+    if wide {
+        query_2 = A::cast_from(query[query_base + feature_2 * query.stride(3)]);
+        query_3 = A::cast_from(query[query_base + feature_3 * query.stride(3)]);
+    }
     let scale = A::new(1.0_f32) / A::cast_from(head_dim as u32).sqrt();
     let mut local_max = A::new(-3.0e38_f32);
     let mut local_sum = A::new(0.0_f32);
     let mut local_output_0 = A::new(0.0_f32);
     let mut local_output_1 = A::new(0.0_f32);
+    let mut local_output_2 = A::new(0.0_f32);
+    let mut local_output_3 = A::new(0.0_f32);
     let mut position = 0usize;
 
     while position < length {
         let key_position = key_base + position * key.stride(2);
-        let score = query_0 * A::cast_from(key[key_position + feature_0 * key.stride(3)])
+        let mut score = query_0 * A::cast_from(key[key_position + feature_0 * key.stride(3)])
             + query_1 * A::cast_from(key[key_position + feature_1 * key.stride(3)]);
+        if wide {
+            score += query_2 * A::cast_from(key[key_position + feature_2 * key.stride(3)])
+                + query_3 * A::cast_from(key[key_position + feature_3 * key.stride(3)]);
+        }
         let score = plane_sum(score) * scale;
         if score > local_max {
             let previous_scale = (local_max - score).exp();
             local_output_0 *= previous_scale;
             local_output_1 *= previous_scale;
+            if wide {
+                local_output_2 *= previous_scale;
+                local_output_3 *= previous_scale;
+            }
             local_sum *= previous_scale;
             local_max = score;
         }
@@ -521,6 +547,12 @@ fn grouped_query_attention_decode_short_kernel<F: Float, A: Float>(
             A::cast_from(value[value_position + feature_0 * value.stride(3)]) * position_scale;
         local_output_1 +=
             A::cast_from(value[value_position + feature_1 * value.stride(3)]) * position_scale;
+        if wide {
+            local_output_2 +=
+                A::cast_from(value[value_position + feature_2 * value.stride(3)]) * position_scale;
+            local_output_3 +=
+                A::cast_from(value[value_position + feature_3 * value.stride(3)]) * position_scale;
+        }
         local_sum += position_scale;
         position += 1;
     }
@@ -529,15 +561,21 @@ fn grouped_query_attention_decode_short_kernel<F: Float, A: Float>(
     let output_base = batch * output.stride(0) + query_head * output.stride(1);
     output[output_base + feature_0 * output_stride] = F::cast_from(local_output_0 / local_sum);
     output[output_base + feature_1 * output_stride] = F::cast_from(local_output_1 / local_sum);
+    if wide {
+        output[output_base + feature_2 * output_stride] = F::cast_from(local_output_2 / local_sum);
+        output[output_base + feature_3 * output_stride] = F::cast_from(local_output_3 / local_sum);
+    }
 }
 
-/// Computes one of eight online-softmax shards for a long Audio8 query head.
+/// Computes one of eight online-softmax shards for a long query head (`wide` as in the short
+/// kernel). A shard row is `[max, sum, head_dim weighted values]`.
 #[cube(launch)]
 fn grouped_query_attention_decode_partial_kernel<F: Float, A: Float>(
     query: &Tensor<F>,
     key: &Tensor<F>,
     value: &Tensor<F>,
     partials: &mut Tensor<A>,
+    #[comptime] wide: bool,
     #[define(F, A)] _dtypes: [StorageType; 2],
 ) {
     let lane = UNIT_POS_X % 32;
@@ -551,27 +589,45 @@ fn grouped_query_attention_decode_partial_kernel<F: Float, A: Float>(
     let head_dim = query.shape(3);
     let feature_0 = lane as usize;
     let feature_1 = feature_0 + 32;
+    let feature_2 = feature_0 + 64;
+    let feature_3 = feature_0 + 96;
     let query_base = batch * query.stride(0) + query_head * query.stride(1);
     let key_base = batch * key.stride(0) + kv_head * key.stride(1);
     let value_base = batch * value.stride(0) + kv_head * value.stride(1);
     let query_0 = A::cast_from(query[query_base + feature_0 * query.stride(3)]);
     let query_1 = A::cast_from(query[query_base + feature_1 * query.stride(3)]);
+    let mut query_2 = A::new(0.0_f32);
+    let mut query_3 = A::new(0.0_f32);
+    if wide {
+        query_2 = A::cast_from(query[query_base + feature_2 * query.stride(3)]);
+        query_3 = A::cast_from(query[query_base + feature_3 * query.stride(3)]);
+    }
     let scale = A::new(1.0_f32) / A::cast_from(head_dim as u32).sqrt();
     let mut local_max = A::new(-3.0e38_f32);
     let mut local_sum = A::new(0.0_f32);
     let mut local_output_0 = A::new(0.0_f32);
     let mut local_output_1 = A::new(0.0_f32);
+    let mut local_output_2 = A::new(0.0_f32);
+    let mut local_output_3 = A::new(0.0_f32);
     let mut position = partial;
 
     while position < length {
         let key_position = key_base + position * key.stride(2);
-        let score = query_0 * A::cast_from(key[key_position + feature_0 * key.stride(3)])
+        let mut score = query_0 * A::cast_from(key[key_position + feature_0 * key.stride(3)])
             + query_1 * A::cast_from(key[key_position + feature_1 * key.stride(3)]);
+        if wide {
+            score += query_2 * A::cast_from(key[key_position + feature_2 * key.stride(3)])
+                + query_3 * A::cast_from(key[key_position + feature_3 * key.stride(3)]);
+        }
         let score = plane_sum(score) * scale;
         if score > local_max {
             let previous_scale = (local_max - score).exp();
             local_output_0 *= previous_scale;
             local_output_1 *= previous_scale;
+            if wide {
+                local_output_2 *= previous_scale;
+                local_output_3 *= previous_scale;
+            }
             local_sum *= previous_scale;
             local_max = score;
         }
@@ -581,6 +637,12 @@ fn grouped_query_attention_decode_partial_kernel<F: Float, A: Float>(
             A::cast_from(value[value_position + feature_0 * value.stride(3)]) * position_scale;
         local_output_1 +=
             A::cast_from(value[value_position + feature_1 * value.stride(3)]) * position_scale;
+        if wide {
+            local_output_2 +=
+                A::cast_from(value[value_position + feature_2 * value.stride(3)]) * position_scale;
+            local_output_3 +=
+                A::cast_from(value[value_position + feature_3 * value.stride(3)]) * position_scale;
+        }
         local_sum += position_scale;
         position += 8;
     }
@@ -594,6 +656,10 @@ fn grouped_query_attention_decode_partial_kernel<F: Float, A: Float>(
     }
     partials[partial_base + (feature_0 + 2) * partial_stride] = local_output_0;
     partials[partial_base + (feature_1 + 2) * partial_stride] = local_output_1;
+    if wide {
+        partials[partial_base + (feature_2 + 2) * partial_stride] = local_output_2;
+        partials[partial_base + (feature_3 + 2) * partial_stride] = local_output_3;
+    }
 }
 
 /// Merges the eight online-softmax shards after the partial dispatch.
@@ -601,6 +667,7 @@ fn grouped_query_attention_decode_partial_kernel<F: Float, A: Float>(
 fn grouped_query_attention_decode_merge_kernel<F: Float, A: Float>(
     partials: &Tensor<A>,
     output: &mut Tensor<F>,
+    #[comptime] wide: bool,
     #[define(F, A)] _dtypes: [StorageType; 2],
 ) {
     let lane = UNIT_POS_X % 32;
@@ -608,6 +675,8 @@ fn grouped_query_attention_decode_merge_kernel<F: Float, A: Float>(
     let batch = CUBE_POS_X as usize / output.shape(1);
     let feature_0 = lane as usize;
     let feature_1 = feature_0 + 32;
+    let feature_2 = feature_0 + 64;
+    let feature_3 = feature_0 + 96;
     let partial_base = batch * partials.stride(0) + query_head * partials.stride(1);
     let partial_stride = partials.stride(2);
     let value_stride = partials.stride(3);
@@ -624,6 +693,8 @@ fn grouped_query_attention_decode_merge_kernel<F: Float, A: Float>(
     let mut denominator = A::new(0.0_f32);
     let mut numerator_0 = A::new(0.0_f32);
     let mut numerator_1 = A::new(0.0_f32);
+    let mut numerator_2 = A::new(0.0_f32);
+    let mut numerator_3 = A::new(0.0_f32);
     partial = 0;
     while partial < 8 {
         let base = partial_base + partial * partial_stride;
@@ -631,6 +702,10 @@ fn grouped_query_attention_decode_merge_kernel<F: Float, A: Float>(
         denominator += partials[base + value_stride] * merge_scale;
         numerator_0 += partials[base + (feature_0 + 2) * value_stride] * merge_scale;
         numerator_1 += partials[base + (feature_1 + 2) * value_stride] * merge_scale;
+        if wide {
+            numerator_2 += partials[base + (feature_2 + 2) * value_stride] * merge_scale;
+            numerator_3 += partials[base + (feature_3 + 2) * value_stride] * merge_scale;
+        }
         partial += 1;
     }
 
@@ -638,6 +713,10 @@ fn grouped_query_attention_decode_merge_kernel<F: Float, A: Float>(
     let output_base = batch * output.stride(0) + query_head * output.stride(1);
     output[output_base + feature_0 * output_stride] = F::cast_from(numerator_0 / denominator);
     output[output_base + feature_1 * output_stride] = F::cast_from(numerator_1 / denominator);
+    if wide {
+        output[output_base + feature_2 * output_stride] = F::cast_from(numerator_2 / denominator);
+        output[output_base + feature_3 * output_stride] = F::cast_from(numerator_3 / denominator);
+    }
 }
 
 #[cube(launch)]
@@ -1636,11 +1715,17 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
         assert_eq!(query.meta.shape()[0], key.meta.shape()[0]);
         assert_eq!(key.meta.shape(), value.meta.shape());
         assert_eq!(query.meta.shape()[2], 1);
-        assert_eq!(query.meta.shape()[3], 64);
-        assert_eq!(key.meta.shape()[3], 64);
+        let head_dim = query.meta.shape()[3];
+        assert!(
+            GROUPED_QUERY_ATTENTION_DECODE_HEAD_DIMS.contains(&head_dim),
+            "grouped-query decode attention supports head widths {GROUPED_QUERY_ATTENTION_DECODE_HEAD_DIMS:?}, not {head_dim}"
+        );
+        assert_eq!(key.meta.shape()[3], head_dim);
         assert!(key.meta.shape()[2] > 0);
         assert!(key.meta.shape()[1] > 0);
         assert!(query.meta.shape()[1].is_multiple_of(key.meta.shape()[1]));
+        // Each of a SIMD group's 32 lanes owns two features (64) or four (128).
+        let wide = head_dim == 128;
         let output = empty_like(&query);
         let cubes = query.meta.shape()[0] * query.meta.shape()[1];
         let dtypes = [
@@ -1656,11 +1741,17 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
                 key.into_tensor_arg(),
                 value.into_tensor_arg(),
                 output.clone().into_tensor_arg(),
+                wide,
                 dtypes,
             );
             return output;
         }
-        let partial_shape = Shape::new([query.meta.shape()[0], query.meta.shape()[1], 8, 66]);
+        let partial_shape = Shape::new([
+            query.meta.shape()[0],
+            query.meta.shape()[1],
+            8,
+            2 + head_dim,
+        ]);
         let partial_handle = query
             .client
             .empty(partial_shape.num_elements() * DType::F32.size());
@@ -1679,6 +1770,7 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
             key.into_tensor_arg(),
             value.into_tensor_arg(),
             partials.clone().into_tensor_arg(),
+            wide,
             dtypes,
         );
         grouped_query_attention_decode_merge_kernel::launch(
@@ -1687,6 +1779,7 @@ impl<R: CubeRuntime> MetalTransformerBackend for CubeBackend<R> {
             CubeDim::new_1d(32),
             partials.into_tensor_arg(),
             output.clone().into_tensor_arg(),
+            wide,
             dtypes,
         );
         output
